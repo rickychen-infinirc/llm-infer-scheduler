@@ -1,4 +1,3 @@
-#Desktop/llm-infer-scheduler/Worker.py
 import socket
 import json
 import threading
@@ -7,10 +6,11 @@ import logging
 import sys
 import os
 import torch
+import queue
 from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer
 from threading import Thread
 
-# 設定日誌
+# 日誌
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -20,13 +20,20 @@ logger = logging.getLogger("LLM-Worker")
 
 class LLMWorker:
     def __init__(self, model_path, node_id="worker-auto", gpu_id=None, 
-                 discovery_port=9001, coordinator_host=None, coordinator_port=9000):
+                 discovery_port=9001, coordinator_host=None, coordinator_port=9000,
+                 max_concurrent=2):
         self.model_path = model_path
         self.node_id = node_id
         self.gpu_id = gpu_id
         self.discovery_port = discovery_port
         self.coordinator_host = coordinator_host
         self.coordinator_port = coordinator_port
+        
+        # 並行處理相關屬性
+        self.max_concurrent = max_concurrent
+        self.active_requests = 0
+        self.active_requests_lock = threading.Lock()
+        self.request_queue = queue.Queue()
         
         # 連接到協調器
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -42,9 +49,50 @@ class LLMWorker:
         # 如果沒有指定協調器地址，進行自動發現
         if not self.coordinator_host:
             self.discover_coordinator()
+        
+        # 啟動多個並行處理線程
+        for i in range(self.max_concurrent):
+            worker_thread = threading.Thread(
+                target=self.parallel_request_processor, 
+                name=f"RequestProcessor-{i}",
+                daemon=True
+            )
+            worker_thread.start()
+            logger.info(f"Started request processor thread {i}")
+
+    def parallel_request_processor(self):
+        """並行處理請求的工作線程"""
+        thread_name = threading.current_thread().name
+        logger.info(f"{thread_name} started")
+        
+        while True:
+            try:
+                # 從隊列中取得請求
+                request = self.request_queue.get(timeout=1)
+                
+                with self.active_requests_lock:
+                    self.active_requests += 1
+                    logger.info(f"{thread_name} processing request, active: {self.active_requests}/{self.max_concurrent}")
+                
+                try:
+                    # 處理請求
+                    self.process_single_request(request)
+                except Exception as e:
+                    logger.error(f"{thread_name} error processing request: {e}")
+                finally:
+                    with self.active_requests_lock:
+                        self.active_requests -= 1
+                        logger.info(f"{thread_name} completed request, active: {self.active_requests}/{self.max_concurrent}")
+                    
+                    self.request_queue.task_done()
+                    
+            except queue.Empty:
+                continue
+            except Exception as e:
+                logger.error(f"{thread_name} unexpected error: {e}")
 
     def discover_coordinator(self):
-        """自動發現協調器"""
+        """自動發現控制器"""
         logger.info("Starting coordinator discovery...")
         
         # 創建發現 socket
@@ -132,7 +180,7 @@ class LLMWorker:
             finally:
                 listen_socket.close()
         
-        # 方式3: 掃描常見 IP 範圍 (作為最後手段)
+        # 方式3: 掃描常見 IP 範圍
         if not coordinators_found:
             logger.info("No coordinator found via broadcast, trying IP scan...")
             coordinators_found = self.scan_for_coordinators()
@@ -141,7 +189,6 @@ class LLMWorker:
         
         # 選擇最佳協調器
         if coordinators_found:
-            # 按時間戳排序，選擇最新的
             coordinators_found.sort(key=lambda x: x.get('timestamp', 0), reverse=True)
             best_coordinator = coordinators_found[0]
             
@@ -297,7 +344,9 @@ class LLMWorker:
                 'model': self.model_path,
                 'device': str(self.device),
                 'gpu_id': self.gpu_id,
-                'max_length': 2048
+                'max_length': 2048,
+                'max_concurrent': self.max_concurrent,
+                'active_requests': 0
             }
             
             # 如果有 GPU 信息，添加到註冊信息中
@@ -306,7 +355,7 @@ class LLMWorker:
                 worker_info['gpu_memory'] = f"{torch.cuda.get_device_properties(self.gpu_id).total_memory / 1024**3:.1f} GB"
             
             self.socket.sendall(json.dumps(worker_info).encode('utf-8') + b'\n')
-            logger.info(f"Sent registration info to coordinator")
+            logger.info(f"Sent registration info to coordinator (max_concurrent: {self.max_concurrent})")
             
             # 接收確認信息
             data = b''
@@ -359,10 +408,11 @@ class LLMWorker:
                     try:
                         request = json.loads(message.decode('utf-8'))
                         logger.info(f"Received request: {request.get('data', {}).get('prompt', '')[:30]}...")
-                        # 使用daemon線程處理請求，避免阻塞主循環
-                        request_thread = Thread(target=self.process_request, args=(request,))
-                        request_thread.daemon = True
-                        request_thread.start()
+                        
+                        # 放入隊列而不是直接處理
+                        self.request_queue.put(request)
+                        logger.debug(f"Request queued, queue size: {self.request_queue.qsize()}")
+                        
                     except json.JSONDecodeError as e:
                         logger.error(f"JSON decode error: {e}")
                         logger.error(f"Problematic message: {message[:100]}")
@@ -378,7 +428,12 @@ class LLMWorker:
         # 重新連接
         self.reconnect()
 
-    def process_request(self, request):
+    def format_prompt(self, user_input):
+        """格式化prompt以獲得更好的回應"""
+        formatted = f"用戶：{user_input}\n助手："
+        return formatted
+
+    def process_single_request(self, request):
         """處理單個請求"""
         try:
             # 解析請求
@@ -390,51 +445,56 @@ class LLMWorker:
             max_length = data.get('max_length', 1024)
             temperature = data.get('temperature', 0.7)
             
-            logger.info(f"Processing request for client {client_id}: prompt length {len(prompt)}")
+            thread_name = threading.current_thread().name
+            logger.info(f"{thread_name} processing request for client {client_id}: {prompt[:30]}...")
+            
+            # 添加系統提示來控制模型行為
+            formatted_prompt = self.format_prompt(prompt)
             
             # 顯示當前 GPU 使用情況
             if self.device.type == 'cuda':
                 memory_used = torch.cuda.memory_allocated(self.device) / 1024**3
                 memory_total = torch.cuda.get_device_properties(self.device).total_memory / 1024**3
-                logger.info(f"GPU {self.gpu_id} memory usage: {memory_used:.2f}/{memory_total:.1f} GB")
+                logger.info(f"{thread_name} GPU {self.gpu_id} memory usage: {memory_used:.2f}/{memory_total:.1f} GB")
             
-            # 向協調器發送流式響應
+            # 向控制器發送streaming
             try:
-                # 將任務狀態發送給客戶端
                 start_msg = {
                     'type': 'start',
-                    'message': 'Starting generation...'
+                    'message': 'Starting generation...',
+                    'worker_thread': thread_name
                 }
                 self.send_response(start_msg)
                 
-                # 設置流式生成
                 streamer = TextIteratorStreamer(self.tokenizer, skip_prompt=True, skip_special_tokens=True)
                 
                 # 記錄推理開始時間
                 start_time = time.time()
                 
-                # 準備輸入並移動到正確設備
-                inputs = self.tokenizer(prompt, return_tensors="pt")
+                inputs = self.tokenizer(formatted_prompt, return_tensors="pt")
                 inputs = {k: v.to(self.device) for k, v in inputs.items()}
                 
-                # 在單獨線程中生成文本
                 generation_kwargs = {
                     'input_ids': inputs['input_ids'],
                     'attention_mask': inputs.get('attention_mask', None),
                     'max_new_tokens': max_length,
-                    'temperature': temperature,
-                    'top_p': 0.9,
+                    'temperature': max(temperature, 0.1),  
+                    'top_p': 0.9,                          
+                    'top_k': 40,                           
+                    'repetition_penalty': 1.05,            
                     'streamer': streamer,
                     'do_sample': True,
-                    'pad_token_id': self.tokenizer.eos_token_id
+                    'pad_token_id': self.tokenizer.eos_token_id,
+                    'eos_token_id': self.tokenizer.eos_token_id,
+                    'early_stopping': True,                
+                    'no_repeat_ngram_size': 3,            
                 }
                 
-                # 確保生成參數也在正確設備上
+                # 使用 CUDA context 確保線程安全
                 with torch.cuda.device(self.device):
                     thread = Thread(target=self.model.generate, kwargs=generation_kwargs)
                     thread.start()
                     
-                    # 流式發送生成的token
                     generated_text = ""
                     token_count = 0
                     for new_text in streamer:
@@ -442,42 +502,40 @@ class LLMWorker:
                         token_count += 1
                         token_msg = {
                             'type': 'token',
-                            'token': new_text
+                            'token': new_text,
+                            'worker_thread': thread_name
                         }
                         self.send_response(token_msg)
                         
-                        # 控制發送頻率，避免網絡堵塞
-                        if token_count % 5 == 0:  # 每5個token休息一次
+                        if token_count % 5 == 0:  
                             time.sleep(0.01)
                     
-                    # 等待生成線程完成
                     thread.join()
                 
-                # 發送完成消息
                 inference_time = time.time() - start_time
                 end_msg = {
                     'type': 'end',
                     'message': 'Generation complete',
                     'inference_time': inference_time,
                     'total_length': len(generated_text),
-                    'gpu_id': self.gpu_id
+                    'gpu_id': self.gpu_id,
+                    'worker_thread': thread_name
                 }
                 self.send_response(end_msg)
                 
-                logger.info(f"Streaming completed for client {client_id}: {len(generated_text)} chars, {inference_time:.2f}s, {token_count} tokens")
+                logger.info(f"{thread_name} completed for client {client_id}: {len(generated_text)} chars, {inference_time:.2f}s, {token_count} tokens")
             
             except Exception as e:
-                logger.error(f"Error streaming response: {e}")
-                # 發送錯誤信息
+                logger.error(f"{thread_name} error streaming response: {e}")
                 error_msg = {
                     'type': 'error',
-                    'error': str(e)
+                    'error': str(e),
+                    'worker_thread': thread_name
                 }
                 self.send_response(error_msg)
             
         except Exception as e:
             logger.error(f"Error processing request: {e}")
-            # 發送錯誤信息
             error_msg = {
                 'type': 'error',
                 'error': str(e)
@@ -485,10 +543,8 @@ class LLMWorker:
             self.send_response(error_msg)
 
     def send_response(self, response):
-        """安全地發送響應"""
         try:
             response_json = json.dumps(response, ensure_ascii=False).encode('utf-8') + b'\n'
-            # 確保一次性發送完整的 JSON
             total_sent = 0
             while total_sent < len(response_json):
                 sent = self.socket.send(response_json[total_sent:])
@@ -501,9 +557,9 @@ class LLMWorker:
             raise
 
     def reconnect(self):
-        """重新連接到協調器"""
+        """重新連接到控制器"""
         max_retries = 10
-        retry_delay = 5  # 初始延遲5秒
+        retry_delay = 5  
         
         for attempt in range(max_retries):
             logger.info(f"Attempting to reconnect to coordinator (attempt {attempt+1}/{max_retries})...")
@@ -511,27 +567,23 @@ class LLMWorker:
                 self.socket.close()
                 self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 
-                # 重新發現協調器（如果原始發現失敗）
                 if not self.coordinator_host:
                     self.discover_coordinator()
                 
                 if self.connect_to_coordinator():
                     logger.info("Reconnected to coordinator")
-                    # 啟動請求處理線程
                     threading.Thread(target=self.handle_requests, daemon=True).start()
                     return True
             except Exception as e:
                 logger.error(f"Reconnection attempt failed: {e}")
             
-            # 延遲重試，指數增長策略
             time.sleep(retry_delay)
-            retry_delay = min(retry_delay * 2, 60)  # 最大延遲60秒
+            retry_delay = min(retry_delay * 2, 60)  
         
         logger.error("Failed to reconnect after maximum attempts")
         return False
 
     def start(self):
-        """啟動工作節點"""
         logger.info(f"Attempting to connect to coordinator at {self.coordinator_host}:{self.coordinator_port}")
         
         if self.connect_to_coordinator():
@@ -540,7 +592,6 @@ class LLMWorker:
             
             logger.info(f"Worker started, connected to coordinator {self.coordinator_host}:{self.coordinator_port}")
             
-            # 保持程序運行
             try:
                 while True:
                     time.sleep(1)
@@ -552,36 +603,38 @@ class LLMWorker:
             logger.error("Failed to connect to coordinator")
 
 if __name__ == "__main__":
-    import argparse
-    
-    parser = argparse.ArgumentParser(description='LLM Worker Node with Auto Discovery')
-    parser.add_argument('--model', type=str, required=True, help='Model path')
-    parser.add_argument('--node-id', type=str, default=None, help='Node identifier (auto-generated if not specified)')
-    parser.add_argument('--gpu', type=int, default=None, help='Specific GPU ID to use (e.g., 0, 1). If not specified, will use GPU 0')
-    parser.add_argument('--host', type=str, default=None, help='Coordinator host (optional, will auto-discover if not specified)')
-    parser.add_argument('--port', type=int, default=9000, help='Coordinator port')
-    parser.add_argument('--discovery-port', type=int, default=9001, help='Discovery service port')
-    
-    args = parser.parse_args()
-    
-    # 自動生成 node_id
-    if not args.node_id:
-        import uuid
-        hostname = socket.gethostname()
-        node_id = f"worker-{hostname}-{str(uuid.uuid4())[:8]}"
-        if args.gpu is not None:
-            node_id += f"-gpu{args.gpu}"
-        args.node_id = node_id
-    
-    try:
-        worker = LLMWorker(
-            model_path=args.model,
-            node_id=args.node_id,
-            gpu_id=args.gpu,
-            coordinator_host=args.host,
-            coordinator_port=args.port,
-            discovery_port=args.discovery_port
-        )
-        worker.start()
-    except Exception as e:
-        logger.error(f"Worker error: {e}")
+   import argparse
+   
+   parser = argparse.ArgumentParser(description='LLM Worker Node with Parallel Processing')
+   parser.add_argument('--model', type=str, required=True, help='Model path')
+   parser.add_argument('--node-id', type=str, default=None, help='Node identifier (auto-generated if not specified)')
+   parser.add_argument('--gpu', type=int, default=None, help='Specific GPU ID to use (e.g., 0, 1). If not specified, will use GPU 0')
+   parser.add_argument('--host', type=str, default=None, help='Coordinator host (optional, will auto-discover if not specified)')
+   parser.add_argument('--port', type=int, default=9000, help='Coordinator port')
+   parser.add_argument('--discovery-port', type=int, default=9001, help='Discovery service port')
+   parser.add_argument('--max-concurrent', type=int, default=2, help='Maximum concurrent requests (default: 2)')
+   
+   args = parser.parse_args()
+   
+   # 自動生成 node_id
+   if not args.node_id:
+       import uuid
+       hostname = socket.gethostname()
+       node_id = f"worker-{hostname}-{str(uuid.uuid4())[:8]}"
+       if args.gpu is not None:
+           node_id += f"-gpu{args.gpu}"
+       args.node_id = node_id
+   
+   try:
+       worker = LLMWorker(
+           model_path=args.model,
+           node_id=args.node_id,
+           gpu_id=args.gpu,
+           coordinator_host=args.host,
+           coordinator_port=args.port,
+           discovery_port=args.discovery_port,
+           max_concurrent=args.max_concurrent
+       )
+       worker.start()
+   except Exception as e:
+       logger.error(f"Worker error: {e}")

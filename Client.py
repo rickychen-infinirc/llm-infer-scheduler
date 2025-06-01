@@ -122,7 +122,7 @@ class LLMClient:
         
         # 方式3: 檢查常見地址
         if not coordinators_found:
-            logger.info("🔍 Checking common addresses...")
+            logger.info(" Checking common addresses...")
             common_addresses = ['localhost', '127.0.0.1', '192.168.1.1', '192.168.0.1']
             
             for addr in common_addresses:
@@ -144,16 +144,15 @@ class LLMClient:
                 except:
                     continue
         
-        # 方式4: 網段掃描 (最後手段)
+        # 方式4: 網段掃描 
         if not coordinators_found:
-            logger.info("🔍 Scanning local network...")
+            logger.info(" Scanning local network...")
             coordinators_found = self.scan_for_coordinators()
         
         discovery_socket.close()
         
-        # 選擇最佳協調器
+
         if coordinators_found:
-            # 按時間戳排序，選擇最新的
             coordinators_found.sort(key=lambda x: x.get('timestamp', 0), reverse=True)
             best_coordinator = coordinators_found[0]
             
@@ -162,7 +161,7 @@ class LLMClient:
             
             logger.info(f"Selected controller: {self.coordinator_host}:{self.coordinator_port}")
             
-            # 顯示額外信息
+
             if best_coordinator.get('web_port'):
                 logger.info(f"Web UI available at: http://{self.coordinator_host}:{best_coordinator['web_port']}")
             
@@ -170,16 +169,16 @@ class LLMClient:
                 logger.info(f"Connected workers: {best_coordinator['worker_count']}")
             
             if len(coordinators_found) > 1:
-                logger.info(f"ℹ️  Found {len(coordinators_found)} coordinators, selected the most recent one")
+                logger.info(f"Found {len(coordinators_found)} coordinators, selected the most recent one")
         else:
-            logger.error("❌ No coordinator found!")
-            logger.info("💡 Please ensure a coordinator is running on the network")
-            logger.info("   You can also specify a coordinator manually with --host <ip>")
+            logger.error("No coordinator found!")
+            logger.info("Please ensure a coordinator is running on the network")
+            logger.info("You can also specify a coordinator manually with --host <ip>")
             raise RuntimeError("Coordinator discovery failed")
 
     def scan_for_coordinators(self):
         """掃描本地網絡尋找協調器"""
-        logger.info("🔍 Scanning local network for coordinators...")
+        logger.info("Scanning local network for coordinators...")
         
         try:
             # 獲取本機 IP
@@ -207,7 +206,7 @@ class LLMClient:
                     test_socket.close()
                     
                     if result == 0:
-                        logger.info(f"✅ Found coordinator at {ip}:{self.coordinator_port}")
+                        logger.info(f" Found coordinator at {ip}:{self.coordinator_port}")
                         coordinators_found.append({
                             'host': ip,
                             'port': self.coordinator_port,
@@ -255,7 +254,7 @@ class LLMClient:
                     try:
                         response = json.loads(data.decode('utf-8'))
                         if response.get('status') == 'connected':
-                            logger.info(f"✅ Connected to worker {response.get('worker_id')}")
+                            logger.info(f"Connected to worker {response.get('worker_id')}")
                     except json.JSONDecodeError:
                         logger.debug("No JSON response from coordinator")
                         
@@ -269,7 +268,7 @@ class LLMClient:
                 return True
             
         except Exception as e:
-            logger.error(f"❌ Connection error: {e}")
+            logger.error(f"Connection error: {e}")
             if self.socket:
                 try:
                     self.socket.close()
@@ -277,7 +276,7 @@ class LLMClient:
                     pass
             return False
     
-    def send_request(self, prompt, max_length=1024, temperature=0.7):
+    def send_request(self, prompt, max_length=8192, temperature=0.9):
         """發送推理請求"""
         if not self.connected:
             logger.error("Not connected to server")
@@ -310,6 +309,7 @@ class LLMClient:
         """接收並處理單個響應"""
         buffer = b''
         response_complete = False
+        generation_started = False
         
         try:
             while not response_complete and self.running:
@@ -335,9 +335,19 @@ class LLMClient:
                     if message:
                         try:
                             response = json.loads(message.decode('utf-8'))
-                            if self.process_response(response):
+                            result = self.process_response(response)
+                            
+                            # 檢查響應類型
+                            response_type = response.get('type', '')
+                            if response_type == 'start':
+                                generation_started = True
+                            elif response_type == 'end' and generation_started:
                                 response_complete = True
                                 break
+                            elif response_type == 'error':
+                                response_complete = True
+                                break
+                                
                         except json.JSONDecodeError as e:
                             # 忽略心跳和其他非JSON消息
                             if message == b'pong':
@@ -372,31 +382,31 @@ class LLMClient:
             total_length = response.get('total_length', 0)
             gpu_id = response.get('gpu_id')
             
-            print(f"\n")
+            print()  # 換行用
             print(f"Generation complete: {total_length} chars, {inference_time:.2f}s", end="")
             if gpu_id is not None:
                 print(f", GPU {gpu_id}")
             else:
                 print()
-            return True  # 響應完成
+            return True  
         
         elif response_type == 'error':
             error = response.get('error', 'Unknown error')
-            print(f"\n❌ Error: {error}")
-            return True  # 響應完成（雖然是錯誤）
+            print(f"\n Error: {error}")
+            return True  
         
-        # 處理普通消息（無類型）
+
         elif 'error' in response:
-            print(f"\n❌ Error: {response.get('error')}")
-            return True  # 響應完成
+            print(f"\n Error: {response.get('error')}")
+            return True  
         
-        # 處理可能的確認消息
+
         elif 'status' in response:
             status = response.get('status', '')
             if status == 'connected':
                 worker_id = response.get('worker_id', 'unknown')
                 print(f"\n Connected to worker {worker_id}")
-            return False  # 不是響應完成
+            return False  
             
         return False
     
@@ -408,7 +418,7 @@ class LLMClient:
         print("="*60)
         
         if not self.connect():
-            print("❌ Failed to connect to server. Please check the connection and try again.")
+            print("Failed to connect to server. Please check the connection and try again.")
             return
             
         print("Connected to LLM service!")
@@ -445,13 +455,13 @@ class LLMClient:
                 if prompt.strip():
                     success = self.send_request(prompt, max_length, temperature)
                     if not success:
-                        print("❌ Failed to send message. Connection may be lost.")
+                        print(" Failed to send message. Connection may be lost.")
                         break
                     
                     # 接收響應
                     response_received = self.receive_response()
                     if not response_received and self.running:
-                        print("\n⚠️  No response received or connection lost.")
+                        print("\n No response received or connection lost.")
                         break
                         
             except KeyboardInterrupt:
@@ -471,7 +481,7 @@ class LLMClient:
                 self.socket.close()
             except:
                 pass
-        print("📡 Connection closed.")
+        print("Connection closed.")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='LLM Client with Auto-Discovery')
@@ -479,8 +489,8 @@ if __name__ == "__main__":
                        help='Coordinator host (use "auto" for auto-discovery, default: auto)')
     parser.add_argument('--port', type=int, default=9000, help='Coordinator port (default: 9000)')
     parser.add_argument('--discovery-port', type=int, default=9001, help='Discovery port (default: 9001)')
-    parser.add_argument('--max-length', type=int, default=1024, help='Maximum length of generated text')
-    parser.add_argument('--temperature', type=float, default=0.7, help='Temperature for text generation')
+    parser.add_argument('--max-length', type=int, default=8192, help='Maximum length of generated text')
+    parser.add_argument('--temperature', type=float, default=0.9, help='Temperature for text generation')
     
     args = parser.parse_args()
     

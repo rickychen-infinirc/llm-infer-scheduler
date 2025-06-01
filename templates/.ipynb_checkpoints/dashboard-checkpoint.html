@@ -1,0 +1,483 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LLM Scheduler Dashboard</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #f8fafc;
+            color: #334155;
+            line-height: 1.6;
+        }
+        
+        .header {
+            background: linear-gradient(135deg, #3b82f6, #1d4ed8);
+            color: white;
+            padding: 2rem;
+            text-align: center;
+        }
+        
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 2rem;
+        }
+        
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(350px, 1fr));
+            gap: 1.5rem;
+            margin-bottom: 2rem;
+        }
+        
+        .card {
+            background: white;
+            border-radius: 8px;
+            padding: 1.5rem;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+            border: 1px solid #e2e8f0;
+        }
+        
+        .card h2 {
+            margin-bottom: 1rem;
+            color: #1e293b;
+            font-size: 1.25rem;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+        
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 1rem;
+        }
+        
+        .stats-extended {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 1rem;
+        }
+        
+        .stat {
+            text-align: center;
+            padding: 1rem;
+            background: #f1f5f9;
+            border-radius: 6px;
+        }
+        
+        .stat-value {
+            font-size: 2rem;
+            font-weight: bold;
+            color: #3b82f6;
+        }
+        
+        .stat-label {
+            font-size: 0.875rem;
+            color: #64748b;
+            text-transform: uppercase;
+        }
+        
+        .worker, .client, .request {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 0.75rem;
+            margin-bottom: 0.5rem;
+            background: #f8fafc;
+            border-radius: 6px;
+            border: 1px solid #e2e8f0;
+            transition: all 0.3s ease;
+        }
+        
+        .worker:hover, .client:hover, .request:hover {
+            background: #f1f5f9;
+            transform: translateX(2px);
+        }
+        
+        .worker-info, .client-info, .request-info {
+            flex: 1;
+        }
+        
+        .worker-name, .client-name, .request-id {
+            font-weight: 600;
+            color: #1e293b;
+        }
+        
+        .worker-details, .client-details, .request-details {
+            font-size: 0.875rem;
+            color: #64748b;
+            margin-top: 0.25rem;
+        }
+        
+        .status {
+            padding: 0.25rem 0.75rem;
+            border-radius: 12px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+        
+        .status-idle { background: #dcfce7; color: #166534; }
+        .status-busy { background: #fecaca; color: #991b1b; }
+        .status-partial { background: #fef3c7; color: #92400e; }
+        .status-full { background: #fecaca; color: #991b1b; }
+        .status-processing { background: #fef3c7; color: #92400e; }
+        .status-completed { background: #dcfce7; color: #166534; }
+        .status-failed { background: #fecaca; color: #991b1b; }
+        .status-pending { background: #dbeafe; color: #1d4ed8; }
+        
+        .gpu-badge {
+            background: #3b82f6;
+            color: white;
+            padding: 0.125rem 0.5rem;
+            border-radius: 10px;
+            font-size: 0.75rem;
+            margin-right: 0.5rem;
+        }
+        
+        .load-bar {
+            width: 100%;
+            height: 4px;
+            background: #e2e8f0;
+            border-radius: 2px;
+            margin-top: 0.5rem;
+            overflow: hidden;
+        }
+        
+        .load-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #10b981, #3b82f6, #f59e0b);
+            border-radius: 2px;
+            transition: width 0.5s ease;
+        }
+        
+        .scrollable {
+            max-height: 350px;
+            overflow-y: auto;
+        }
+        
+        .empty {
+            text-align: center;
+            padding: 2rem;
+            color: #9ca3af;
+        }
+        
+        .refresh {
+            position: fixed;
+            top: 1rem;
+            right: 1rem;
+            width: 12px;
+            height: 12px;
+            background: #10b981;
+            border-radius: 50%;
+            animation: pulse 2s infinite;
+        }
+        
+        .connection-status {
+            position: fixed;
+            top: 1rem;
+            right: 3rem;
+            padding: 0.5rem 1rem;
+            border-radius: 20px;
+            font-size: 0.875rem;
+            font-weight: 600;
+        }
+        
+        .connected {
+            background: #dcfce7;
+            color: #166534;
+        }
+        
+        .disconnected {
+            background: #fecaca;
+            color: #991b1b;
+        }
+        
+        .last-update {
+            font-size: 0.75rem;
+            color: #9ca3af;
+            text-align: center;
+            margin-top: 1rem;
+        }
+        
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+    </style>
+</head>
+<body>
+    <div class="refresh"></div>
+    <div class="connection-status" id="connection-status">Connecting...</div>
+    
+    <div class="header">
+        <h1>LLM Scheduler Dashboard</h1>
+        <p>Uptime: <span id="uptime">0s</span> | Last Update: <span id="last-update">Never</span></p>
+    </div>
+
+    <div class="container">
+        <div class="grid">
+
+            <div class="card">
+                <h2>System Statistics</h2>
+                <div class="stats">
+                    <div class="stat">
+                        <div class="stat-value" id="total-requests">0</div>
+                        <div class="stat-label">Total</div>
+                    </div>
+                    <div class="stat">
+                        <div class="stat-value" id="completed-requests">0</div>
+                        <div class="stat-label">Completed</div>
+                    </div>
+                    <div class="stat">
+                        <div class="stat-value" id="active-requests">0</div>
+                        <div class="stat-label">Active</div>
+                    </div>
+                    <div class="stat">
+                        <div class="stat-value" id="queue-size">0</div>
+                        <div class="stat-label">Queue</div>
+                    </div>
+                </div>
+            </div>
+
+
+            <div class="card">
+                <h2>Parallel Processing</h2>
+                <div class="stats-extended">
+                    <div class="stat">
+                        <div class="stat-value" id="total-capacity">0</div>
+                        <div class="stat-label">Capacity</div>
+                    </div>
+                    <div class="stat">
+                        <div class="stat-value" id="total-active">0</div>
+                        <div class="stat-label">Active</div>
+                    </div>
+                    <div class="stat">
+                        <div class="stat-value" id="utilization">0%</div>
+                        <div class="stat-label">Utilization</div>
+                    </div>
+                </div>
+            </div>
+
+
+            <div class="card">
+                <h2>Workers (<span id="worker-count">0</span>)</h2>
+                <div class="scrollable" id="workers-list">
+                    <div class="empty">No workers connected</div>
+                </div>
+            </div>
+
+
+            <div class="card">
+                <h2>Clients (<span id="client-count">0</span>)</h2>
+                <div class="scrollable" id="clients-list">
+                    <div class="empty">No clients connected</div>
+                </div>
+            </div>
+
+
+            <div class="card">
+                <h2>Recent Requests</h2>
+                <div class="scrollable" id="request-history">
+                    <div class="empty">No recent requests</div>
+                </div>
+            </div>
+        </div>
+        
+        <div class="last-update" id="last-update-time">
+            Last updated: Never
+        </div>
+    </div>
+
+<script>
+    let socket;
+    let lastUpdateTime = null;
+    let connectionAttempts = 0;
+    let updateCounter = 0;
+    
+    function updateConnectionStatus(status) {
+        const element = document.getElementById('connection-status');
+        if (status === 'connected') {
+            element.textContent = 'Connected';
+            element.className = 'connection-status connected';
+            connectionAttempts = 0;
+        } else if (status === 'connecting') {
+            element.textContent = 'Connecting...';
+            element.className = 'connection-status disconnected';
+        } else {
+            element.textContent = 'Disconnected';
+            element.className = 'connection-status disconnected';
+        }
+    }
+    
+    function updateLastUpdateTime() {
+        lastUpdateTime = new Date();
+        const timeString = lastUpdateTime.toLocaleTimeString() + '.' + String(lastUpdateTime.getMilliseconds()).padStart(3, '0');
+        document.getElementById('last-update').textContent = timeString;
+        document.getElementById('last-update-time').textContent = `Last updated: ${timeString}`;
+    }
+    
+    function connectSocket() {
+        updateConnectionStatus('connecting');
+        console.log('Attempting to connect to SocketIO...');
+        
+        socket = io({
+            reconnection: true,
+            reconnectionAttempts: 999,
+            reconnectionDelay: 500,
+            timeout: 3000,
+            forceNew: true
+        });
+        
+        socket.on('connect', function() {
+            console.log('Connected to SocketIO server');
+            updateConnectionStatus('connected');
+            connectionAttempts = 0;
+            
+
+            socket.emit('request_update');
+        });
+        
+        socket.on('disconnect', function() {
+            console.log('Disconnected from SocketIO server');
+            updateConnectionStatus('disconnected');
+        });
+        
+        socket.on('connect_error', function(error) {
+            console.log('SocketIO connection error:', error);
+            connectionAttempts++;
+            updateConnectionStatus('disconnected');
+        });
+        
+        socket.on('system_update', function(data) {
+            updateCounter++;
+            console.log(`📊 Update #${updateCounter} received:`, data);
+            updateLastUpdateTime();
+            
+
+            updateUI(data);
+        });
+    }
+    
+    function updateUI(data) {
+        try {
+
+            document.getElementById('total-requests').textContent = data.stats.total_requests || 0;
+            document.getElementById('completed-requests').textContent = data.stats.completed_requests || 0;
+            document.getElementById('active-requests').textContent = data.stats.active_requests || 0;
+            document.getElementById('queue-size').textContent = data.stats.queue_size || 0;
+            
+
+            document.getElementById('total-capacity').textContent = data.stats.total_capacity || 0;
+            document.getElementById('total-active').textContent = data.stats.total_active || 0;
+            document.getElementById('utilization').textContent = (data.stats.utilization || 0) + '%';
+            
+
+            const uptime = Math.floor(data.uptime || 0);
+            const hours = Math.floor(uptime / 3600);
+            const minutes = Math.floor((uptime % 3600) / 60);
+            const seconds = uptime % 60;
+            document.getElementById('uptime').textContent = 
+                hours > 0 ? `${hours}h ${minutes}m` : 
+                minutes > 0 ? `${minutes}m ${seconds}s` : `${seconds}s`;
+            
+
+            const workersList = document.getElementById('workers-list');
+            document.getElementById('worker-count').textContent = data.workers.length;
+            
+            if (data.workers.length === 0) {
+                workersList.innerHTML = '<div class="empty">No workers connected</div>';
+            } else {
+                workersList.innerHTML = data.workers.map(w => {
+                    const loadPercentage = w.load_percentage || 0;
+                    const activeRequests = w.active_requests || 0;
+                    const maxConcurrent = w.max_concurrent || 1;
+                    
+                    return `
+                        <div class="worker">
+                            <div class="worker-info">
+                                <div class="worker-name">${w.node_id}</div>
+                                <div class="worker-details">
+                                    ${w.gpu_id !== null ? `<span class="gpu-badge">GPU ${w.gpu_id}</span>` : ''}
+                                    ${w.model} • ${w.total_requests || 0} total • ${activeRequests}/${maxConcurrent} active
+                                    <div class="load-bar">
+                                        <div class="load-fill" style="width: ${loadPercentage}%"></div>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="status status-${w.status}">${w.status} (${loadPercentage}%)</div>
+                        </div>
+                    `;
+                }).join('');
+            }
+            
+
+            const clientsList = document.getElementById('clients-list');
+            document.getElementById('client-count').textContent = data.clients.length;
+            
+            if (data.clients.length === 0) {
+                clientsList.innerHTML = '<div class="empty">No clients connected</div>';
+            } else {
+                clientsList.innerHTML = data.clients.map(c => `
+                    <div class="client">
+                        <div class="client-info">
+                            <div class="client-name">Client ${c.id}</div>
+                            <div class="client-details">${c.address} • ${c.requests_sent} requests • since ${c.connected_at}</div>
+                        </div>
+                    </div>
+                `).join('');
+            }
+            
+
+            const historyList = document.getElementById('request-history');
+            
+            if (!data.request_history || data.request_history.length === 0) {
+                historyList.innerHTML = '<div class="empty">No recent requests</div>';
+            } else {
+                historyList.innerHTML = data.request_history.slice(-15).reverse().map(r => `
+                    <div class="request">
+                        <div class="request-info">
+                            <div class="request-id">Req ${r.id} ${r.worker_id !== null ? `(Worker ${r.worker_id})` : ''}</div>
+                            <div class="request-details">${r.prompt} • ${r.timestamp}</div>
+                        </div>
+                        <div class="status status-${r.status}">${r.status}</div>
+                    </div>
+                `).join('');
+            }
+            
+        } catch (error) {
+            console.error('Error updating UI:', error);
+        }
+    }
+    
+
+    connectSocket();
+    
+
+    setInterval(() => {
+        if (socket && socket.connected) {
+            socket.emit('request_update');
+        } else {
+            console.log('Socket disconnected, attempting to reconnect...');
+            connectSocket();
+        }
+    }, 5000);
+    
+
+    document.addEventListener('keydown', function(e) {
+        if (e.key === 'r' || e.key === 'R') {
+            console.log('Manual refresh triggered');
+            if (socket && socket.connected) {
+                socket.emit('request_update');
+            }
+        }
+    });
+</script>
+</body>
+</html>

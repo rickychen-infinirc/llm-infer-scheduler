@@ -189,19 +189,31 @@ class LLMCoordinator:
         threading.Thread(target=update_clients, daemon=True).start()
 
     def get_system_status(self):
-        """獲取系統狀態"""
+        """獲取系統狀態（包含並行資訊）"""
         with self.worker_lock:
             workers = []
             for worker in self.worker_nodes:
+                load_percentage = (worker['active_requests'] / worker['max_concurrent']) * 100
+                
+                if worker['active_requests'] == 0:
+                    status = 'idle'
+                elif worker['active_requests'] < worker['max_concurrent']:
+                    status = 'partial'
+                else:
+                    status = 'full'
+                
                 workers.append({
                     'id': worker['id'],
                     'node_id': worker['info']['node_id'],
                     'device': worker['info']['device'],
                     'gpu_id': worker['info'].get('gpu_id'),
                     'model': worker['info']['model'].split('/')[-1],
-                    'status': 'busy' if worker['busy'] else 'idle',
-                    'total_requests': 0,
-                    'discovery_ip': worker.get('discovery_ip', 'N/A')  # 顯示 Worker 的 IP
+                    'status': status,
+                    'active_requests': worker['active_requests'],
+                    'max_concurrent': worker['max_concurrent'],
+                    'load_percentage': round(load_percentage, 1),
+                    'total_requests': worker.get('total_requests', 0),
+                    'discovery_ip': worker.get('discovery_ip', 'N/A')
                 })
         
         with self.client_lock:
@@ -212,17 +224,25 @@ class LLMCoordinator:
         with self.history_lock:
             recent_history = self.request_history[-20:]
         
+        total_capacity = sum(w['max_concurrent'] for w in self.worker_nodes)
+        total_active = sum(w['active_requests'] for w in self.worker_nodes)
+        
         return {
             'workers': workers,
             'clients': clients,
-            'stats': self.stats,
+            'stats': {
+                **self.stats,
+                'total_capacity': total_capacity,
+                'total_active': total_active,
+                'utilization': round((total_active / total_capacity * 100) if total_capacity > 0 else 0, 1)
+            },
             'request_history': recent_history,
             'uptime': time.time() - self.stats['uptime'],
             'coordinator_ip': self.local_ip
         }
 
     def register_worker(self, worker_socket, worker_info, worker_ip=None):
-        """註冊新的工作節點"""
+        """註冊新的工作節點（支援並行）"""
         with self.worker_lock:
             worker_id = len(self.worker_nodes)
             worker = {
@@ -230,11 +250,15 @@ class LLMCoordinator:
                 'socket': worker_socket,
                 'info': worker_info,
                 'busy': False,
+                'active_requests': 0,
+                'max_concurrent': worker_info.get('max_concurrent', 1),
                 'last_active': time.time(),
-                'discovery_ip': worker_ip  # 記錄 Worker 的 IP
+                'discovery_ip': worker_ip,
+                'total_requests': 0
             }
             self.worker_nodes.append(worker)
             logger.info(f"Worker {worker_id} registered from {worker_ip}: {worker_info}")
+            logger.info(f"Worker {worker_id} supports {worker['max_concurrent']} concurrent requests")
             
             if len(self.worker_nodes) == 1 and not self.dispatching:
                 self.dispatching = True
@@ -242,7 +266,7 @@ class LLMCoordinator:
                 
             return worker_id
 
-    # ... 其他方法保持不變 ...
+
     def register_client(self, client_socket, addr):
         """註冊客戶端"""
         with self.client_lock:
@@ -262,22 +286,36 @@ class LLMCoordinator:
                 del self.clients[client_id]
 
     def get_available_worker(self):
-        """獲取可用的工作節點"""
+        """獲取可用的工作節點（支援並行）"""
         with self.worker_lock:
             for worker in self.worker_nodes:
-                if not worker['busy']:
-                    worker['busy'] = True
+                if worker['active_requests'] < worker['max_concurrent']:
+                    worker['active_requests'] += 1
+                    if worker['active_requests'] == 1:
+                        worker['busy'] = True
+                    logger.info(f"Assigned request to worker {worker['id']}, "
+                               f"active: {worker['active_requests']}/{worker['max_concurrent']}")
                     return worker
+            
+            logger.debug("No available workers found")
             return None
 
     def release_worker(self, worker_id):
-        """釋放工作節點"""
+        """釋放工作節點（支援並行）"""
         with self.worker_lock:
             for worker in self.worker_nodes:
                 if worker['id'] == worker_id:
-                    worker['busy'] = False
+                    if worker['active_requests'] > 0:
+                        worker['active_requests'] -= 1
+                    
+                    if worker['active_requests'] == 0:
+                        worker['busy'] = False
+                    
                     worker['last_active'] = time.time()
-                    logger.info(f"Worker {worker_id} released")
+                    worker['total_requests'] += 1
+                    
+                    logger.info(f"Worker {worker_id} released, "
+                               f"active: {worker['active_requests']}/{worker['max_concurrent']}")
                     return True
             return False
 
@@ -306,8 +344,8 @@ class LLMCoordinator:
                     break
 
     def dispatch_requests(self):
-        """分發請求到可用的工作節點"""
-        logger.info("Request dispatcher started")
+        """分發請求到可用的工作節點（支援並行）"""
+        logger.info("Request dispatcher started with parallel support")
         while True:
             try:
                 client_socket, request_data, request_id, client_id = self.requests_queue.get()
@@ -315,14 +353,29 @@ class LLMCoordinator:
                 self.stats['total_requests'] += 1
                 self.stats['active_requests'] += 1
                 
-                logger.info(f"Dispatching request {request_id}: {request_data.get('prompt', '')[:30]}...")
+                prompt_preview = request_data.get('prompt', '')[:30]
+                logger.info(f"Dispatching request {request_id}: {prompt_preview}...")
+                
+                with self.worker_lock:
+                    total_active = sum(w['active_requests'] for w in self.worker_nodes)
+                    total_capacity = sum(w['max_concurrent'] for w in self.worker_nodes)
+                    logger.info(f"System load: {total_active}/{total_capacity} "
+                               f"({(total_active/total_capacity*100):.1f}% utilized)")
                 
                 worker = None
+                wait_count = 0
                 while worker is None:
                     worker = self.get_available_worker()
                     if worker is None:
-                        logger.info("No available workers, waiting...")
+                        wait_count += 1
+                        if wait_count == 1:
+                            logger.info("No available workers, waiting...")
+                        elif wait_count % 10 == 0:
+                            logger.info(f"Still waiting for available worker... ({wait_count}s)")
                         time.sleep(1)
+                
+                if wait_count > 0:
+                    logger.info(f"Found available worker after {wait_count}s wait")
                 
                 try:
                     self.update_request_status(request_id, 'processing', worker['id'])
@@ -336,7 +389,8 @@ class LLMCoordinator:
                     
                     request_json = json.dumps(request_with_client).encode('utf-8') + b'\n'
                     worker['socket'].sendall(request_json)
-                    logger.info(f"Request {request_id} dispatched to worker {worker['id']}")
+                    logger.info(f"Request {request_id} dispatched to worker {worker['id']} "
+                               f"(load: {worker['active_requests']}/{worker['max_concurrent']})")
                     
                     threading.Thread(
                         target=self.handle_worker_response, 
@@ -356,7 +410,7 @@ class LLMCoordinator:
                 time.sleep(1)
 
     def handle_worker_response(self, worker, client_socket, request_id):
-        """處理工作節點的響應並轉發給客戶端"""
+        """處理工作節點的響應並轉發給客戶端（支援並行）"""
         worker_socket = worker['socket']
         worker_id = worker['id']
         buffer = b''
@@ -384,6 +438,10 @@ class LLMCoordinator:
                         try:
                             response = json.loads(message.decode('utf-8'))
                             
+                            response['worker_id'] = worker_id
+                            if 'worker_thread' in response:
+                                response['worker_info'] = f"Worker-{worker_id}-{response['worker_thread']}"
+                            
                             response_json = json.dumps(response).encode('utf-8') + b'\n'
                             client_socket.sendall(response_json)
                             
@@ -391,17 +449,20 @@ class LLMCoordinator:
                                 self.stats['completed_requests'] += 1
                                 self.stats['active_requests'] -= 1
                                 self.update_request_status(request_id, 'completed')
+                                logger.info(f"Request {request_id} completed on worker {worker_id}")
                                 return
                             elif response.get('type') == 'error':
                                 self.stats['failed_requests'] += 1
                                 self.stats['active_requests'] -= 1
                                 self.update_request_status(request_id, 'failed')
+                                logger.error(f"Request {request_id} failed on worker {worker_id}")
                                 return
                                 
                         except json.JSONDecodeError:
                             continue
                             
                 except socket.timeout:
+                    logger.warning(f"Timeout waiting for worker {worker_id} response")
                     break
                     
         except Exception as e:
